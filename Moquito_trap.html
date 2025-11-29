@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Mosquito Trap Dashboard</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, setPersistence, browserSessionPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // setLogLevel('Debug'); // Uncomment for debugging Firestore
+
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const __initial_auth_token = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db;
+        let auth;
+        let userId = 'anonymous'; // Default until auth state is known
+        const deviceDocRef = (dbInstance, uid) => doc(collection(dbInstance, `artifacts/${appId}/public/data/mosquito_trap_data`), 'device_001');
+
+        // State to hold current sensor readings for simulation
+        let currentReadings = {
+            fan_speed: 'OFF',
+            trap_status: 'EMPTY',
+            uv_status: 'OFF',
+        };
+
+        const STATUS_CLASSES = {
+            'ON': 'text-success-green bg-success-green/20',
+            'OFF': 'text-gray-400 bg-gray-600/20',
+            'HIGH': 'text-danger-red bg-danger-red/20',
+            'LOW': 'text-primary-blue bg-primary-blue/20',
+            'FULL': 'text-danger-red bg-danger-red/20',
+            'FILLING': 'text-warning-yellow bg-warning-yellow/20',
+            'EMPTY': 'text-success-green bg-success-green/20',
+            'ALERT': 'text-danger-red bg-danger-red/20',
+            'NORMAL': 'text-success-green bg-success-green/20',
+        };
+
+        // --- UI Update Functions ---
+        function updateUI(data) {
+            const fanValue = data.fan_speed || 'OFF';
+            const trapValue = data.trap_status || 'EMPTY';
+            const uvValue = data.uv_status || 'OFF';
+
+            // 1. Fan Speed Card
+            document.getElementById('fan-value').textContent = fanValue;
+            const fanStatusEl = document.getElementById('fan-status');
+            fanStatusEl.textContent = fanValue;
+            fanStatusEl.className = 'font-medium p-1 px-2 rounded-full ' + STATUS_CLASSES[fanValue];
+
+            // 2. Trap Status Card
+            document.getElementById('trap-value').textContent = trapValue;
+            const trapStatusEl = document.getElementById('trap-status');
+            trapStatusEl.textContent = trapValue;
+            trapStatusEl.className = 'font-medium p-1 px-2 rounded-full ' + STATUS_CLASSES[trapValue];
+            
+            // 3. UV LED Card
+            document.getElementById('uv-value').textContent = uvValue;
+            const uvStatusEl = document.getElementById('uv-status');
+            uvStatusEl.textContent = uvValue;
+            uvStatusEl.className = 'font-medium p-1 px-2 rounded-full ' + STATUS_CLASSES[uvValue];
+
+            // 4. Alert Banner Logic (Crucial ECE Feature)
+            let alertMessage = '';
+            if (trapValue === 'FULL' || fanValue === 'OFF') {
+                alertMessage = trapValue === 'FULL' 
+                    ? 'ALERT: Trap is FULL! Time for pad replacement.' 
+                    : 'WARNING: Fan is OFF. Check Smart Scheduling or Power.';
+            }
+
+            const alertBanner = document.getElementById('alert-banner');
+            const alertMsgEl = document.getElementById('alert-message');
+
+            if (alertMessage) {
+                alertMsgEl.textContent = alertMessage;
+                // Set color for danger alert
+                alertBanner.className = 'p-4 rounded-lg shadow-xl mb-6 transition-all duration-300 transform scale-y-100 h-auto opacity-100 overflow-visible ' + 
+                    (trapValue === 'FULL' ? 'bg-danger-red/10 border border-danger-red text-danger-red' : 'bg-warning-yellow/10 border border-warning-yellow text-warning-yellow');
+            } else {
+                // Hide alert
+                alertBanner.className = 'p-4 rounded-lg shadow-xl mb-6 transition-all duration-300 transform scale-y-0 h-0 opacity-0 overflow-hidden';
+            }
+            
+            // Update simulation inputs to reflect current data
+            document.getElementById('sim-fan').value = fanValue;
+            document.getElementById('sim-trap').value = trapValue;
+            document.getElementById('sim-uv').value = uvValue;
+        }
+
+        // --- Firebase Core Logic ---
+        async function initializeFirebase() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+
+                // 1. Authenticate (required for Firestore security rules)
+                await setPersistence(auth, browserSessionPersistence);
+                if (__initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // Wait for auth state to settle
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        // 2. Start Real-time Data Listener
+                        startDataListener();
+                    } else {
+                        // Handle sign out or failed auth (though anonymous sign-in should prevent this)
+                        console.error("User authentication failed or is not available.");
+                        document.getElementById('fan-value').textContent = 'ERROR';
+                        document.getElementById('trap-value').textContent = 'AUTH FAIL';
+                        document.getElementById('uv-value').textContent = '...';
+                    }
+                });
+                
+            } catch (error) {
+                console.error("Error initializing or authenticating Firebase:", error);
+                document.getElementById('fan-value').textContent = 'FAIL';
+                document.getElementById('trap-value').textContent = 'CONFIG';
+                document.getElementById('uv-value').textContent = '...';
+            }
+        }
+
+        function startDataListener() {
+            // Path: artifacts/{appId}/public/data/mosquito_trap_data/device_001
+            const deviceRef = deviceDocRef(db, userId);
+            
+            // Real-time listener: data will update immediately when the MCU/Simulation sends new data
+            onSnapshot(deviceRef, (docSnapshot) => {
+                if (docSnapshot.exists()) {
+                    const data = docSnapshot.data();
+                    currentReadings = {
+                        fan_speed: data.fan_speed || 'OFF',
+                        trap_status: data.trap_status || 'EMPTY',
+                        uv_status: data.uv_status || 'OFF',
+                    };
+                    updateUI(data);
+                    console.log("Real-time Data Update:", data);
+                } else {
+                    console.log("No data found for device_001. Initializing with defaults.");
+                    // Initialize document if it doesn't exist
+                    simulateUpdate();
+                }
+            }, (error) => {
+                console.error("Firestore snapshot error:", error);
+            });
+        }
+
+        window.simulateUpdate = async function() {
+            if (!db || !userId || !auth.currentUser) {
+                alert('Firebase not initialized or authenticated. Check console for errors.');
+                return;
+            }
+
+            const fanSpeed = document.getElementById('sim-fan').value;
+            const trapStatus = document.getElementById('sim-trap').value;
+            const uvStatus = document.getElementById('sim-uv').value;
+
+            const newData = {
+                fan_speed: fanSpeed,
+                trap_status: trapStatus,
+                uv_status: uvStatus,
+                last_updated: new Date().toISOString()
+            };
+
+            const deviceRef = deviceDocRef(db, userId);
+
+            try {
+                // Use setDoc to create or overwrite the document for the device
+                await setDoc(deviceRef, newData);
+                console.log("Simulation data sent successfully:", newData);
+            } catch (error) {
+                console.error("Error sending simulation data:", error);
+                alert("Failed to send data. See console for details.");
+            }
+        }
+
+        // Initialize Firebase on window load
+        window.onload = initializeFirebase;
+    </script>
+
+    <style>
+        /* Custom scrollbar for aesthetics */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-thumb { background: #6b7280; border-radius: 4px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        .bg-card-dark { background-color: #374151; }
+        .bg-bg-dark { background-color: #1f2937; }
+        
+        /* Tailwind custom colors defined in script block */
+        .text-primary-blue { color: #1c64f2; }
+        .border-primary-blue { border-color: #1c64f2; }
+        .hover\:shadow-primary-blue\/30:hover { box-shadow: 0 10px 15px -3px rgba(28, 100, 242, 0.3), 0 4px 6px -4px rgba(28, 100, 242, 0.3); }
+
+        .text-success-green { color: #10b981; }
+        .border-success-green { border-color: #10b981; }
+        .hover\:shadow-success-green\/30:hover { box-shadow: 0 10px 15px -3px rgba(16, 185, 129, 0.3), 0 4px 6px -4px rgba(16, 185, 129, 0.3); }
+
+        .text-danger-red { color: #ef4444; }
+        .border-danger-red { border-color: #ef4444; }
+        .hover\:shadow-danger-red\/30:hover { box-shadow: 0 10px 15px -3px rgba(239, 68, 68, 0.3), 0 4px 6px -4px rgba(239, 68, 68, 0.3); }
+
+        .text-warning-yellow { color: #f59e0b; }
+        .border-warning-yellow { border-color: #f59e0b; }
+        .hover\:shadow-warning-yellow\/30:hover { box-shadow: 0 10px 15px -3px rgba(245, 158, 11, 0.3), 0 4px 6px -4px rgba(245, 158, 11, 0.3); }
+    </style>
+</head>
+<body class="bg-bg-dark text-white min-h-screen p-4 sm:p-8 font-sans">
+
+    <div class="max-w-4xl mx-auto">
+        <header class="text-center mb-10">
+            <h1 class="text-3xl sm:text-4xl font-extrabold text-primary-blue mb-2">Smart Sticky-Trap Monitor</h1>
+            <p class="text-gray-400 text-lg">Real-Time Trap Status and Control Panel</p>
+        </header>
+
+        <!-- Alert Banner -->
+        <div id="alert-banner" class="p-4 rounded-lg shadow-xl mb-6 transition-all duration-300 transform scale-y-0 h-0 opacity-0 overflow-hidden" role="alert">
+            <div class="flex items-center">
+                <svg id="alert-icon" class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                <div id="alert-message" class="text-lg font-medium"></div>
+            </div>
+        </div>
+
+        <!-- Sensor Data Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+
+            <!-- Card 1: Fan Speed/Control (PWM) -->
+            <div class="bg-card-dark p-6 rounded-xl shadow-2xl border-b-4 border-primary-blue hover:shadow-primary-blue/30 transition duration-300">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-xl font-semibold text-gray-300">Fan Speed (PWM)</h2>
+                    <!-- Fan Icon -->
+                    <svg class="w-8 h-8 text-primary-blue" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11.335 4.36a9.5 9.5 0 01-14.823-3.65m14.823 3.65h-4.75m-1.25 1.75a1 1 1 01-1-1v-4.5a1 1 011-1H22a1 1 011 1v4.5a1 1 01-1 1h-4.75m-5.25-6.25a2 2 01-4 0v4a2 2 014 0v-4z"></path></svg>
+                </div>
+                <p id="fan-value" class="text-5xl font-bold text-primary-blue">--</p>
+                <p class="text-gray-500 mt-1">Mode: <span id="fan-status" class="font-medium">...</span></p>
+            </div>
+
+            <!-- Card 2: Trap Full Status (Ultrasonic/IR Sensor) -->
+            <div class="bg-card-dark p-6 rounded-xl shadow-2xl border-b-4 border-success-green hover:shadow-success-green/30 transition duration-300">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-xl font-semibold text-gray-300">Sticky Trap Status</h2>
+                    <!-- Trap/Bin Icon -->
+                    <svg class="w-8 h-8 text-success-green" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2h14zm-4 0V9a2 2 0 00-2-2m-2-4h-2m1 14h2"></path></svg>
+                </div>
+                <p id="trap-value" class="text-5xl font-bold text-success-green">--</p>
+                <p class="text-gray-500 mt-1">Condition: <span id="trap-status" class="font-medium">...</span></p>
+            </div>
+
+            <!-- Card 3: UV LED Status (Attraction Element) -->
+            <div class="bg-card-dark p-6 rounded-xl shadow-2xl border-b-4 border-warning-yellow hover:shadow-warning-yellow/30 transition duration-300">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-xl font-semibold text-gray-300">UV LED Status</h2>
+                    <!-- Lightbulb Icon -->
+                    <svg class="w-8 h-8 text-warning-yellow" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 17v4m-4.478-4l.803-2.407M16.94 14.59l.803 2.407m-13.682-3.411L13.5 13.5m-1.954-2.887l.803-2.407m-5.876 5.25l2.192 2.192"></path></svg>
+                </div>
+                <p id="uv-value" class="text-5xl font-bold text-warning-yellow">--</p>
+                <p class="text-gray-500 mt-1">Power: <span id="uv-status" class="font-medium">...</span></p>
+            </div>
+        </div>
+
+        <!-- Simulation and Controls Section -->
+        <div class="bg-card-dark p-6 rounded-xl shadow-2xl">
+            <h2 class="text-2xl font-semibold text-gray-200 mb-4">Simulation Panel (For Testing)</h2>
+            <p class="text-sm text-gray-400 mb-4">Select new states below and click "Update Device Status" to demonstrate the real-time functionality of the dashboard via Firebase. This simulates the data pushed by your physical ESP32/ESP8266.</p>
+
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+                <!-- Fan Speed Input -->
+                <div>
+                    <label for="sim-fan" class="block text-sm font-medium text-gray-400 mb-1">Simulate Fan Speed</label>
+                    <select id="sim-fan" class="w-full p-2.5 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-primary-blue focus:border-primary-blue">
+                        <option value="OFF">OFF</option>
+                        <option value="LOW">LOW (Power Saving)</option>
+                        <option value="HIGH">HIGH (Max Suction)</option>
+                    </select>
+                </div>
+                <!-- Trap Status Input -->
+                <div>
+                    <label for="sim-trap" class="block text-sm font-medium text-gray-400 mb-1">Simulate Trap Status</label>
+                    <select id="sim-trap" class="w-full p-2.5 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-success-green focus:border-success-green">
+                        <option value="EMPTY">EMPTY</option>
+                        <option value="FILLING">FILLING</option>
+                        <option value="FULL">FULL (Trigger Alert)</option>
+                    </select>
+                </div>
+                <!-- UV LED Status Input -->
+                <div>
+                    <label for="sim-uv" class="block text-sm font-medium text-gray-400 mb-1">Simulate UV LED</label>
+                    <select id="sim-uv" class="w-full p-2.5 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-warning-yellow focus:border-warning-yellow">
+                        <option value="OFF">OFF</option>
+                        <option value="ON">ON</option>
+                    </select>
+                </div>
+            </div>
+
+            <button onclick="simulateUpdate()" class="w-full bg-primary-blue hover:bg-primary-blue/80 text-white font-bold py-3 rounded-lg shadow-lg hover:shadow-xl transition duration-300 flex items-center justify-center">
+                <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h5M20 20h-5v-5M4 20h5v-5M20 4h-5v5"></path></svg>
+                Update Device Status
+            </button>
+        </div>
+        
+        <footer class="text-center text-gray-500 text-sm mt-8">
+            <p>Project: Smart Sticky-Trap Mosquito Killer | ECE Focus: IoT, Sensing, Motor Control.</p>
+        </footer>
+
+    </div>
+</body>
+</html>
